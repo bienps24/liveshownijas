@@ -20,7 +20,7 @@ const JOIN_LINKS = (process.env.JOIN_LINKS || "")
 const WEB_ACCESS_LINK = process.env.WEB_ACCESS_LINK || "https://viralvideos.cloud/";
 
 // Optional: direct app download link (set in Railway if you have one)
-const APP_DOWNLOAD_LINK = process.env.APP_DOWNLOAD_LINK || "";
+const APP_DOWNLOAD_LINK = process.env.APP_DOWNLOAD_LINK || "https://viralvideos.cloud/download.html";
 
 const PORT = process.env.PORT || 3000;
 
