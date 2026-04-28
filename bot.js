@@ -1,170 +1,225 @@
 require("dotenv").config();
-
-const express  = require("express");
+const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 
-// ─── ENV ──────────────────────────────────────────────────────────────────────
-const BOT_TOKEN = process.env.BOT_TOKEN;
+// ─── ENV ─────────────────────────────────────────────────────────────────────
+const BOT_TOKEN        = process.env.BOT_TOKEN;
+const WEBHOOK_DOMAIN   = process.env.WEBHOOK_DOMAIN;          // e.g. https://yourapp.railway.app
+const WEBHOOK_PATH     = process.env.WEBHOOK_PATH || "/webhook";
+const PORT             = process.env.PORT || 3000;
+const WEB_ACCESS_LINK  = process.env.WEB_ACCESS_LINK  || "https://viralvideos.cloud/";
+const APP_DOWNLOAD_LINK= process.env.APP_DOWNLOAD_LINK|| "https://viralvideos.cloud/download.html";
 
-const REQUIRED_CHAT_IDS = (process.env.REQUIRED_CHAT_IDS || "")
-  .split(",")
-  .map((id) => id.trim())
-  .filter(Boolean);
-
-const JOIN_LINKS = (process.env.JOIN_LINKS || "")
-  .split(",")
-  .map((link) => link.trim())
-  .filter(Boolean);
-
-// Web access URL (can override via env, defaults to viralvideos.cloud)
-const WEB_ACCESS_LINK = process.env.WEB_ACCESS_LINK || "https://viralvideos.cloud/";
-
-// Optional: direct app download link (set in Railway if you have one)
-const APP_DOWNLOAD_LINK = process.env.APP_DOWNLOAD_LINK || "https://viralvideos.cloud/download.html";
-
-const PORT = process.env.PORT || 3000;
+// 3 required channels (join links + chat IDs from env, or hardcoded fallback)
+const CHANNELS = [
+  {
+    chatId:   process.env.CHAT_ID_1 || "",
+    joinLink: process.env.JOIN_LINK_1 || "https://t.me/+IoPOsvouDR01OGE9",
+    label:    "Channel 1",
+  },
+  {
+    chatId:   process.env.CHAT_ID_2 || "",
+    joinLink: process.env.JOIN_LINK_2 || "https://t.me/+OPZmLSKHu9YxNjBl",
+    label:    "Channel 2",
+  },
+  {
+    chatId:   process.env.CHAT_ID_3 || "",
+    joinLink: process.env.JOIN_LINK_3 || "https://t.me/+kQYmjEENv9ZjZDU9",
+    label:    "Channel 3",
+  },
+];
 
 // ─── VALIDATION ───────────────────────────────────────────────────────────────
 if (!BOT_TOKEN) {
-  console.error("Missing BOT_TOKEN");
+  console.error("[FATAL] Missing BOT_TOKEN");
   process.exit(1);
 }
 
-if (!REQUIRED_CHAT_IDS.length) {
-  console.error("Missing REQUIRED_CHAT_IDS");
-  process.exit(1);
+// ─── RATE LIMITER ─────────────────────────────────────────────────────────────
+// Prevents users from spamming "Check Again" — a major ban trigger on Telegram
+const COOLDOWN_MS = 5000; // 5 seconds between checks per user
+const cooldowns   = new Map();
+
+function isOnCooldown(userId) {
+  const last = cooldowns.get(userId);
+  if (!last) return false;
+  return Date.now() - last < COOLDOWN_MS;
 }
 
-// ─── EXPRESS HEALTH SERVER ────────────────────────────────────────────────────
-const app = express();
-
-app.get("/", (_req, res) => res.send("Force Join Bot is running."));
-
-app.get("/health", (_req, res) =>
-  res.json({
-    ok: true,
-    requiredChats: REQUIRED_CHAT_IDS.length,
-    joinLinks: JOIN_LINKS.length,
-  })
-);
-
-app.listen(PORT, () => console.log(`Health server running on port ${PORT}`));
-
-// ─── BOT ──────────────────────────────────────────────────────────────────────
-const bot = new Telegraf(BOT_TOKEN);
-
-function isJoinedStatus(status) {
-  return ["creator", "administrator", "member"].includes(status);
+function setCooldown(userId) {
+  cooldowns.set(userId, Date.now());
+  // Auto-cleanup after 1 min to prevent memory leak
+  setTimeout(() => cooldowns.delete(userId), 60_000);
 }
 
-async function isUserJoined(chatId, userId) {
+// ─── CHANNEL CHECK ────────────────────────────────────────────────────────────
+const JOINED_STATUSES = new Set(["creator", "administrator", "member"]);
+
+async function isUserInChannel(chatId, userId) {
+  if (!chatId) return false; // skip unconfigured channels
   try {
     const member = await bot.telegram.getChatMember(chatId, userId);
-    return isJoinedStatus(member.status);
-  } catch (error) {
-    console.error(
-      `Failed checking chat ${chatId}:`,
-      error.description || error.message
-    );
+    return JOINED_STATUSES.has(member.status);
+  } catch (err) {
+    // Telegram throws if bot isn't in the channel — log but don't crash
+    console.warn(`[WARN] Could not check ${chatId}:`, err.description || err.message);
     return false;
   }
 }
 
-async function checkAccess(userId) {
-  const checks = [];
-  for (const chatId of REQUIRED_CHAT_IDS) {
-    const joined = await isUserJoined(chatId, userId);
-    checks.push({ chatId, joined });
-  }
+async function checkAllChannels(userId) {
+  const results = await Promise.all(
+    CHANNELS.map(async (ch) => ({
+      ...ch,
+      joined: await isUserInChannel(ch.chatId, userId),
+    }))
+  );
   return {
-    allJoined: checks.every((item) => item.joined),
-    checks,
+    allJoined: results.every((r) => r.joined),
+    results,
   };
 }
 
-function buildJoinKeyboard() {
-  const buttons = JOIN_LINKS.map((link, index) => [
-    Markup.button.url(`📌 Join Here ${index + 1}`, link),
-  ]);
-  buttons.push([Markup.button.callback("✅ I Joined — Check Again", "check_join")]);
+// ─── KEYBOARDS ────────────────────────────────────────────────────────────────
+function buildJoinKeyboard(results) {
+  const buttons = results.map((ch, i) => {
+    const icon = ch.joined ? "✅" : "📌";
+    return [Markup.button.url(`${icon} ${ch.label}`, ch.joinLink)];
+  });
+  buttons.push([Markup.button.callback("🔄 I Joined — Check Again", "check_join")]);
   return Markup.inlineKeyboard(buttons);
 }
 
 function buildAccessKeyboard() {
-  const buttons = [
+  return Markup.inlineKeyboard([
     [Markup.button.url("🌐 Watch on Web", WEB_ACCESS_LINK)],
-  ];
-
-  if (APP_DOWNLOAD_LINK) {
-    buttons.push([Markup.button.url("📱 Download the App", APP_DOWNLOAD_LINK)]);
-  }
-
-  return Markup.inlineKeyboard(buttons);
+    [Markup.button.url("📱 Download App", APP_DOWNLOAD_LINK)],
+  ]);
 }
 
-async function sendAccessResult(ctx) {
-  const userId = ctx.from.id;   // fixed — was markdown-corrupted
-  const result  = await checkAccess(userId);
-
-  if (!result.allJoined) {
-    return ctx.reply(
-      "🔒 *Access Locked*\n\nSumali muna sa lahat ng required channels bago mag-access.\n\nTapos i-tap ang *I Joined — Check Again*.",
-      { parse_mode: "Markdown", ...buildJoinKeyboard() }
-    );
-  }
-
-  return ctx.reply(
-    "✅ *Verified! Access Granted.*\n\nPiliin kung paano mo gustong manood:\n\n🌐 *Watch on Web* — buksan sa browser\n📱 *Download the App* — para sa mas magandang experience",
-    { parse_mode: "Markdown", ...buildAccessKeyboard() }
+// ─── MESSAGES ─────────────────────────────────────────────────────────────────
+function buildLockedMessage(results) {
+  const lines = results.map((ch) => {
+    const status = ch.joined ? "✅ Joined" : "❌ Not yet";
+    return `• ${ch.label}: ${status}`;
+  });
+  return (
+    `🔒 *Access Locked*\n\n` +
+    `Sumali muna sa lahat ng channels bago ma-unlock ang access:\n\n` +
+    lines.join("\n") +
+    `\n\n_Tap a channel button to join, then tap *Check Again*._`
   );
 }
 
-// ─── HANDLERS ─────────────────────────────────────────────────────────────────
-bot.start(async (ctx) => {
-  const text    = ctx.message?.text || "";
-  const payload = text.split(" ")[1];
+const ACCESS_GRANTED_MSG =
+  `✅ *Access Granted!*\n\n` +
+  `Verified ka na! Piliin kung paano mo gustong manood:\n\n` +
+  `🌐 *Watch on Web* — sa browser\n` +
+  `📱 *Download App* — para sa mas magandang experience`;
 
-  if (payload === "check_access") {
-    return sendAccessResult(ctx);
-  }
+const WELCOME_MSG =
+  `👋 *Welcome to Viral Videos!*\n\n` +
+  `Para ma-unlock ang access, sumali muna sa aming mga channels.\n\n` +
+  `I-tap ang *Check Access* pagkatapos mag-join.`;
 
-  return ctx.reply(
-    "👋 *Welcome!*\n\nSumali muna sa required channels para ma-unlock ang access.\n\nTapos i-tap ang *Check Access* button.",
-    {
-      parse_mode: "Markdown",
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback("🔍 Check Access", "check_join")],
-      ]),
+// ─── CORE HANDLER ─────────────────────────────────────────────────────────────
+async function handleAccessCheck(ctx, isCallback = false) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  // Rate limit — prevents spam detection by Telegram
+  if (isOnCooldown(userId)) {
+    if (isCallback) {
+      await ctx.answerCbQuery("⏳ Wait a moment before checking again.", { show_alert: false });
     }
-  );
-});
-
-bot.action("check_join", async (ctx) => {
-  try {
-    await ctx.answerCbQuery("Checking...");
-    return sendAccessResult(ctx);
-  } catch (error) {
-    console.error("check_join error:", error.description || error.message);
-    return ctx.reply("Something went wrong. Please try again.");
+    return;
   }
+  setCooldown(userId);
+
+  if (isCallback) {
+    await ctx.answerCbQuery("Checking your membership...");
+  }
+
+  const { allJoined, results } = await checkAllChannels(userId);
+
+  const replyFn = isCallback
+    ? (text, opts) => ctx.editMessageText(text, opts).catch(() => ctx.reply(text, opts))
+    : (text, opts) => ctx.reply(text, opts);
+
+  if (!allJoined) {
+    return replyFn(buildLockedMessage(results), {
+      parse_mode: "Markdown",
+      ...buildJoinKeyboard(results),
+    });
+  }
+
+  return replyFn(ACCESS_GRANTED_MSG, {
+    parse_mode: "Markdown",
+    ...buildAccessKeyboard(),
+  });
+}
+
+// ─── BOT SETUP ────────────────────────────────────────────────────────────────
+const bot = new Telegraf(BOT_TOKEN);
+
+// /start command
+bot.start(async (ctx) => {
+  const payload = ctx.startPayload; // text after /start (e.g. /start check_access)
+  if (payload === "check_access") {
+    return handleAccessCheck(ctx, false);
+  }
+  return ctx.reply(WELCOME_MSG, {
+    parse_mode: "Markdown",
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback("🔍 Check Access", "check_join")],
+    ]),
+  });
 });
 
-bot.catch((error) => {
-  console.error("Bot error:", error);
+// Inline button callback
+bot.action("check_join", (ctx) => handleAccessCheck(ctx, true));
+
+// Global error handler — never let uncaught errors crash the bot
+bot.catch((err, ctx) => {
+  console.error(`[BOT ERROR] Update ${ctx?.update?.update_id}:`, err.message || err);
 });
 
-// ─── START ────────────────────────────────────────────────────────────────────
+// ─── EXPRESS + WEBHOOK ────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+app.get("/", (_req, res) => res.send("Viral Videos Force Join Bot is running."));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, channels: CHANNELS.length, mode: WEBHOOK_DOMAIN ? "webhook" : "polling" })
+);
+
 async function startBot() {
-  try {
+  if (WEBHOOK_DOMAIN) {
+    // ── WEBHOOK MODE (recommended for production / Railway) ──
+    const webhookUrl = `${WEBHOOK_DOMAIN}${WEBHOOK_PATH}`;
+
+    // Register webhook with Telegram
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log(`[INFO] Webhook set: ${webhookUrl}`);
+
+    // Express handles incoming updates from Telegram
+    app.use(WEBHOOK_PATH, (req, res) => bot.handleUpdate(req.body, res));
+
+    app.listen(PORT, () => console.log(`[INFO] Server on port ${PORT}`));
+  } else {
+    // ── LONG POLLING MODE (for local dev only) ──
+    console.warn("[WARN] No WEBHOOK_DOMAIN set — falling back to long polling (dev only)");
+    await bot.telegram.deleteWebhook();
+    app.listen(PORT, () => console.log(`[INFO] Health server on port ${PORT}`));
     await bot.launch();
-    console.log("Telegram bot is running.");
-  } catch (error) {
-    console.error("Failed to launch bot:", error);
-    process.exit(1);
+    console.log("[INFO] Bot launched via polling.");
   }
 }
 
-startBot();
+startBot().catch((err) => {
+  console.error("[FATAL] Failed to start bot:", err);
+  process.exit(1);
+});
 
 process.once("SIGINT",  () => { bot.stop("SIGINT");  process.exit(0); });
 process.once("SIGTERM", () => { bot.stop("SIGTERM"); process.exit(0); });
